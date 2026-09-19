@@ -7,6 +7,8 @@ from typing import List, Optional
 
 SECRET = os.environ.get("DUP_HELPER_SECRET", "")
 BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+LIB_PATH = Path(os.environ.get("DUP_LIB_PATH", "/tmp/dup_lib.json"))
+LIB_MAX = 400
 
 app = FastAPI()
 
@@ -18,8 +20,17 @@ class Item(BaseModel):
     ch: str = ""
     label: str = ""
 
+class KnownFp(BaseModel):
+    key: str
+    fp: str
+    mid: int = 0
+    dur: int = 0
+    ch: str = ""
+    label: str = ""
+
 class ScanIn(BaseModel):
-    items: List[Item]
+    items: List[Item] = []
+    known: Optional[List[KnownFp]] = None
 
 def fpcalc(path: str):
     r = subprocess.run(
@@ -33,35 +44,43 @@ def fpcalc(path: str):
     dur = float(data.get("duration") or 0)
     return raw, dur
 
-def decode_fp(s: str):
-    # chromaprint fpcalc -json fingerprint is a string of integers joined... actually base64-like
-    # fpcalc -json returns fingerprint as comma-separated signed ints when using some versions;
-    # official fpcalc -json: {"duration": 10.0, "fingerprint": "AQA..."} base64
-    # Compare via fpcalc isn't pairwise; we use a simple token overlap on the raw string chunks.
-    # Better: run fpcalc without json and parse, then use bit compare if we have ints.
-    return s
-
 def similar(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
     if a == b:
         return 1.0
-    # sliding block overlap — catches same track with a time shift
     step = 24
     size = 48
     if len(a) < size or len(b) < size:
         return 1.0 if a[:20] == b[:20] else 0.0
     best = 0.0
-    blocks_a = [a[i:i + size] for i in range(0, min(len(a) - size, 800), step)]
-    for blk in blocks_a[:40]:
+    blocks_a = [a[i:i + size] for i in range(0, min(len(a) - size, 1200), step)]
+    for blk in blocks_a[:50]:
         if blk in b:
             best = max(best, 0.92)
         else:
-            # cheap char-overlap
             hit = sum(1 for i in range(0, len(b) - size, step) if b[i:i + size][:12] == blk[:12])
             if hit:
                 best = max(best, 0.7)
     return best
+
+def load_lib():
+    try:
+        if LIB_PATH.exists():
+            data = json.loads(LIB_PATH.read_text())
+            if isinstance(data, list):
+                return data
+    except Exception:
+        pass
+    return []
+
+def save_lib(rows):
+    try:
+        if len(rows) > LIB_MAX:
+            rows = rows[-LIB_MAX:]
+        LIB_PATH.write_text(json.dumps(rows, ensure_ascii=False))
+    except Exception:
+        pass
 
 async def download_file(file_id: str, dest: Path):
     if not BOT_TOKEN:
@@ -83,40 +102,76 @@ def extract_audio(src: Path, dst: Path):
         check=True, capture_output=True, timeout=90
     )
 
+def row_of(item, fp, dur):
+    return {
+        "key": item.key,
+        "fp": fp,
+        "dur": dur,
+        "mid": item.mid,
+        "ch": item.ch,
+        "label": item.label,
+    }
+
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "lib": len(load_lib())}
 
 @app.post("/scan")
 async def scan(body: ScanIn, x_dup_secret: Optional[str] = Header(None)):
     if SECRET and x_dup_secret != SECRET:
         raise HTTPException(401, "bad secret")
-    if len(body.items) < 2:
-        return {"ok": True, "pairs": [], "note": "צריך לפחות שני סרטונים"}
-    fps = []
+    lib = load_lib()
+    known = list(body.known or [])
+    by_key = {}
+    for r in lib:
+        k = str(r.get("key") or "")
+        if k and r.get("fp"):
+            by_key[k] = r
+    for k in known:
+        if k.key and k.fp:
+            by_key[k.key] = row_of(k, k.fp, k.dur)
+    if len(body.items) < 1:
+        return {"ok": True, "pairs": [], "checked": 0, "lib": len(by_key), "fps": [], "note": "אין סרטונים בסיבוב"}
+
+    fresh = []
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
-        for it in body.items[:16]:
-            raw = td / f"{it.key}.bin"
-            wav = td / f"{it.key}.wav"
+        for it in body.items[:12]:
+            raw = td / (str(it.mid) + ".bin")
+            wav = td / (str(it.mid) + ".wav")
             try:
                 await download_file(it.file_id, raw)
                 extract_audio(raw, wav)
                 fp, dur = fpcalc(str(wav))
-                fps.append({"item": it, "fp": fp, "dur": dur})
+                row = row_of(it, fp, dur)
+                fresh.append(row)
+                by_key[it.key] = row
             except Exception as e:
-                fps.append({"item": it, "fp": "", "dur": 0, "err": str(e)[:120]})
+                fresh.append({"key": it.key, "fp": "", "dur": 0, "mid": it.mid, "ch": it.ch, "label": it.label, "err": str(e)[:120]})
+
+    all_rows = [by_key[k] for k in by_key if by_key[k].get("fp")]
+    fresh_keys = set(x["key"] for x in fresh if x.get("fp"))
     pairs = []
-    for x, y in itertools.combinations(fps, 2):
-        if not x["fp"] or not y["fp"]:
+    for x, y in itertools.combinations(all_rows, 2):
+        if x["key"] == y["key"]:
+            continue
+        if x["key"] not in fresh_keys and y["key"] not in fresh_keys:
             continue
         sc = similar(x["fp"], y["fp"])
         if sc < 0.68:
             continue
         pairs.append({
             "score": round(sc, 3),
-            "a": {"key": x["item"].key, "mid": x["item"].mid, "ch": x["item"].ch, "label": x["item"].label, "dur": x["item"].dur},
-            "b": {"key": y["item"].key, "mid": y["item"].mid, "ch": y["item"].ch, "label": y["item"].label, "dur": y["item"].dur},
+            "a": {"key": x["key"], "mid": x.get("mid") or 0, "ch": x.get("ch") or "", "label": x.get("label") or "", "dur": x.get("dur") or 0},
+            "b": {"key": y["key"], "mid": y.get("mid") or 0, "ch": y.get("ch") or "", "label": y.get("label") or "", "dur": y.get("dur") or 0},
         })
     pairs.sort(key=lambda p: -p["score"])
-    return {"ok": True, "pairs": pairs[:5], "checked": len(fps)}
+    save_lib(all_rows)
+    fps_out = [{"key": r["key"], "fp": r["fp"], "mid": r.get("mid") or 0, "ch": r.get("ch") or "", "label": r.get("label") or "", "dur": r.get("dur") or 0} for r in fresh if r.get("fp")]
+    return {
+        "ok": True,
+        "pairs": pairs[:8],
+        "checked": len(fresh),
+        "lib": len(all_rows),
+        "fps": fps_out,
+    }
