@@ -9,12 +9,17 @@ SECRET = os.environ.get("DUP_HELPER_SECRET", "")
 BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 API_ID = os.environ.get("TELEGRAM_API_ID", "")
 API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
+SESSION_STR = os.environ.get("TELEGRAM_SESSION", "").strip()
+SESSION_FILE = Path("/tmp/dup_user.session.txt")
 LIB_PATH = Path(os.environ.get("DUP_LIB_PATH", "/tmp/dup_lib.json"))
 LIB_MAX = 400
 
 app = FastAPI()
 _tg = None
 _tg_lock = asyncio.Lock()
+_auth_client = None
+_auth_hash = ""
+_auth_phone = ""
 
 
 class Item(BaseModel):
@@ -42,6 +47,41 @@ class ScanIn(BaseModel):
     start_mid: int = 0
 
 
+class AuthPhone(BaseModel):
+    phone: str
+
+
+class AuthCode(BaseModel):
+    phone: str = ""
+    code: str
+    password: str = ""
+
+
+def check_secret(x_dup_secret: Optional[str]):
+    if SECRET and x_dup_secret != SECRET:
+        raise HTTPException(401, "bad secret")
+
+
+def saved_session():
+    if SESSION_STR:
+        return SESSION_STR
+    try:
+        if SESSION_FILE.exists():
+            s = SESSION_FILE.read_text().strip()
+            if s:
+                return s
+    except Exception:
+        pass
+    return ""
+
+
+def store_session(s: str):
+    try:
+        SESSION_FILE.write_text(s)
+    except Exception:
+        pass
+
+
 def fpcalc(path: str):
     r = subprocess.run(
         ["fpcalc", "-json", "-length", "90", path],
@@ -50,7 +90,10 @@ def fpcalc(path: str):
     if r.returncode != 0:
         raise RuntimeError((r.stderr or "fpcalc failed")[-200:])
     data = json.loads(r.stdout)
-    return data.get("fingerprint") or "", float(data.get("duration") or 0)
+    fp = data.get("fingerprint") or ""
+    if not fp:
+        raise RuntimeError("אין טביעת סאונד")
+    return fp, float(data.get("duration") or 0)
 
 
 def similar(a: str, b: str) -> float:
@@ -88,16 +131,19 @@ def save_lib(rows):
     try:
         if len(rows) > LIB_MAX:
             rows = rows[-LIB_MAX:]
+        LIB_PATH.parent.mkdir(parents=True, exist_ok=True)
         LIB_PATH.write_text(json.dumps(rows, ensure_ascii=False))
     except Exception:
         pass
 
 
 def extract_audio(src: Path, dst: Path):
-    subprocess.run(
+    r = subprocess.run(
         ["ffmpeg", "-y", "-i", str(src), "-vn", "-ac", "1", "-ar", "16000", "-t", "90", "-f", "wav", str(dst)],
-        check=True, capture_output=True, timeout=90
+        capture_output=True, timeout=90
     )
+    if r.returncode != 0 or not dst.exists() or dst.stat().st_size < 100:
+        raise RuntimeError("ffmpeg: " + ((r.stderr or b"").decode("utf-8", "ignore")[-120:] or "נכשל"))
 
 
 def row_of(item, fp, dur):
@@ -128,44 +174,42 @@ def short_err(e):
     return s[:180]
 
 
+def new_user_client(session=""):
+    from pyrogram import Client
+    kw = dict(
+        name="dupuser",
+        api_id=int(API_ID),
+        api_hash=API_HASH,
+        in_memory=True,
+        no_updates=True,
+    )
+    if session:
+        kw["session_string"] = session
+    return Client(**kw)
+
+
 async def tg_client():
     global _tg
     async with _tg_lock:
         if _tg is not None and getattr(_tg, "is_connected", False):
             return _tg
-        if not (API_ID and API_HASH and BOT_TOKEN):
+        if not (API_ID and API_HASH):
             raise RuntimeError("חסר TELEGRAM_API_ID או TELEGRAM_API_HASH")
-        from pyrogram import Client
-        if _tg is None:
-            _tg = Client(
-                "duphelper",
-                api_id=int(API_ID),
-                api_hash=API_HASH,
-                bot_token=BOT_TOKEN,
-                in_memory=True,
-                no_updates=True,
-            )
+        sess = saved_session()
+        if not sess:
+            raise RuntimeError("חסר חיבור משתמש. צריך טלפון וקוד חד־פעמי.")
+        _tg = new_user_client(sess)
         try:
             await _tg.start()
-        except Exception as e:
-            msg = str(e).lower()
-            if "already" in msg or "started" in msg:
-                return _tg
+        except Exception:
             _tg = None
             raise
+        me = await _tg.get_me()
+        if getattr(me, "is_bot", False):
+            await _tg.stop()
+            _tg = None
+            raise RuntimeError("מחובר כבוט במקום כמשתמש")
         return _tg
-
-
-async def download_small(file_id: str, dest: Path):
-    async with httpx.AsyncClient(timeout=60) as c:
-        g = await c.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile", params={"file_id": file_id})
-        js = g.json()
-        if not js.get("ok"):
-            raise RuntimeError(str(js.get("description") or js))
-        path = js["result"]["file_path"]
-        r = await c.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}")
-        r.raise_for_status()
-        dest.write_bytes(r.content)
 
 
 async def pyro_download(m_or_id, dest: Path):
@@ -174,10 +218,10 @@ async def pyro_download(m_or_id, dest: Path):
     folder.mkdir(parents=True, exist_ok=True)
     out = await client.download_media(m_or_id, file_name=str(folder) + "/")
     if not out:
-        raise RuntimeError("download empty")
+        raise RuntimeError("הורדה ריקה")
     p = Path(out)
+    dest.write_bytes(p.read_bytes())
     if p.resolve() != dest.resolve():
-        dest.write_bytes(p.read_bytes())
         try:
             p.unlink()
         except Exception:
@@ -185,26 +229,26 @@ async def pyro_download(m_or_id, dest: Path):
 
 
 async def download_media_obj(file_id: str, chat_id: str, mid: int, dest: Path):
+    last = None
     if file_id:
         try:
-            await download_small(file_id, dest)
-            return
-        except Exception:
-            try:
-                await pyro_download(file_id, dest)
+            await pyro_download(file_id, dest)
+            if dest.exists() and dest.stat().st_size >= 1000:
                 return
-            except Exception:
-                pass
+        except Exception as e:
+            last = e
     if not chat_id or not mid:
-        raise RuntimeError("אין סרטון להורדה")
+        raise last or RuntimeError("אין סרטון להורדה")
     client = await tg_client()
     m = await client.get_messages(int(chat_id), int(mid))
     if not is_video_msg(m):
         raise RuntimeError("not-video")
     await pyro_download(m, dest)
+    if not dest.exists() or dest.stat().st_size < 1000:
+        raise last or RuntimeError("הורדה נכשלה")
 
 
-async def collect_from_chat(chat_id: str, start_mid: int, limit_videos: int = 3):
+async def collect_from_chat(chat_id: str, start_mid: int, skip_keys, need: int = 3):
     client = await tg_client()
     ch = int(str(chat_id).strip())
     start = int(start_mid or 0)
@@ -218,11 +262,12 @@ async def collect_from_chat(chat_id: str, start_mid: int, limit_videos: int = 3)
             except Exception:
                 continue
     if start < 1:
-        return [], 0, "לא מצאתי הודעות בעמוד. הבוט חייב להיות מנהל שם."
+        return [], 0, "לא מצאתי הודעות בעמוד. המשתמש חייב להיות מנהל שם."
     items = []
     last_seen = start
     note = ""
-    for mid in range(start, max(0, start - 25), -1):
+    seen_video = 0
+    for mid in range(start, max(0, start - 80), -1):
         last_seen = mid - 1
         try:
             m = await client.get_messages(ch, mid)
@@ -231,16 +276,24 @@ async def collect_from_chat(chat_id: str, start_mid: int, limit_videos: int = 3)
             continue
         if not is_video_msg(m):
             continue
+        seen_video += 1
+        key = str(chat_id) + ":" + str(mid)
+        if key in skip_keys:
+            continue
         items.append(Item(
-            key=str(chat_id) + ":" + str(mid),
+            key=key,
             file_id="",
             mid=mid,
             dur=int(getattr(getattr(m, "video", None), "duration", 0) or 0),
             ch=str(chat_id),
             label="",
         ))
-        if len(items) >= limit_videos:
+        if len(items) >= need:
             break
+    if not items and seen_video:
+        note = "מצאתי סרטונים אבל כולם כבר נשמעו"
+    elif not items:
+        note = note or "לא מצאתי סרטון בטווח הזה"
     return items, (last_seen if last_seen > 0 else 0), note
 
 
@@ -265,14 +318,95 @@ def pair_rows(all_rows, fresh_keys):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "lib": len(load_lib()), "strong": bool(API_ID and API_HASH and BOT_TOKEN)}
+    return {
+        "ok": True,
+        "lib": len(load_lib()),
+        "strong": bool(API_ID and API_HASH),
+        "user": bool(saved_session()),
+    }
+
+
+@app.post("/auth/start")
+async def auth_start(body: AuthPhone, x_dup_secret: Optional[str] = Header(None)):
+    global _auth_client, _auth_hash, _auth_phone
+    check_secret(x_dup_secret)
+    if not (API_ID and API_HASH):
+        return {"ok": False, "error": "חסר API_ID"}
+    phone = (body.phone or "").replace(" ", "").replace("-", "")
+    if not phone.startswith("+"):
+        phone = "+" + phone
+    if _auth_client is not None:
+        try:
+            await _auth_client.disconnect()
+        except Exception:
+            pass
+        _auth_client = None
+    c = new_user_client()
+    await c.connect()
+    sent = await c.send_code(phone)
+    _auth_client = c
+    _auth_hash = sent.phone_code_hash
+    _auth_phone = phone
+    return {"ok": True, "phone": phone, "note": "נשלח קוד לטלגרם. שלח את הקוד."}
+
+
+@app.post("/auth/confirm")
+async def auth_confirm(body: AuthCode, x_dup_secret: Optional[str] = Header(None)):
+    global _tg, _auth_client, _auth_hash, _auth_phone
+    check_secret(x_dup_secret)
+    phone = (body.phone or _auth_phone or "").replace(" ", "")
+    if phone and not phone.startswith("+"):
+        phone = "+" + phone
+    if _auth_client is None or not _auth_hash:
+        return {"ok": False, "error": "אין בקשת קוד פתוחה. שלח טלפון קודם."}
+    from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired
+    try:
+        try:
+            await _auth_client.sign_in(phone or _auth_phone, _auth_hash, body.code.strip())
+        except SessionPasswordNeeded:
+            if not body.password:
+                return {"ok": False, "need_password": True, "error": "יש סיסמת שני שלבים. שלח גם אותה."}
+            await _auth_client.check_password(body.password)
+        ss = await _auth_client.export_session_string()
+        store_session(ss)
+        try:
+            await _auth_client.disconnect()
+        except Exception:
+            pass
+        _auth_client = None
+        _tg = None
+        me = None
+        c = new_user_client(ss)
+        await c.start()
+        me = await c.get_me()
+        await c.stop()
+        return {
+            "ok": True,
+            "session": ss,
+            "user": (me.first_name if me else "") + ((" @" + me.username) if me and me.username else ""),
+            "id": me.id if me else 0,
+        }
+    except PhoneCodeInvalid:
+        return {"ok": False, "error": "קוד שגוי"}
+    except PhoneCodeExpired:
+        return {"ok": False, "error": "הקוד פג. שלח טלפון שוב."}
+    except Exception as e:
+        return {"ok": False, "error": short_err(e)}
 
 
 @app.post("/scan")
 async def scan(body: ScanIn, x_dup_secret: Optional[str] = Header(None)):
-    if SECRET and x_dup_secret != SECRET:
-        raise HTTPException(401, "bad secret")
+    check_secret(x_dup_secret)
     try:
+        if not saved_session():
+            return {
+                "ok": False,
+                "error": "חסר חיבור משתמש. צריך טלפון וקוד.",
+                "pairs": [],
+                "checked": 0,
+                "lib": 0,
+                "fps": [],
+            }
         lib = load_lib()
         known = list(body.known or [])
         by_key = {}
@@ -284,42 +418,40 @@ async def scan(body: ScanIn, x_dup_secret: Optional[str] = Header(None)):
             if k.key and k.fp:
                 by_key[k.key] = row_of(k, k.fp, k.dur)
 
-        items = list(body.items or [])
+        chat_id = str(body.chat_id or "").strip()
         next_cur = int(body.start_mid or 0)
         note = ""
-        chat_id = str(body.chat_id or "").strip()
+        items = []
         if chat_id:
             try:
-                found, next_cur, note = await collect_from_chat(chat_id, int(body.start_mid or 0), 3)
-                if found:
-                    items = found
+                items, next_cur, note = await collect_from_chat(chat_id, int(body.start_mid or 0), set(by_key.keys()), 3)
             except Exception as e:
                 note = "קריאת עמוד: " + short_err(e)
+        if not items:
+            items = [it for it in (body.items or []) if it.key not in by_key and (it.file_id or (it.ch and it.mid))]
 
-        usable = [it for it in items if (it.file_id or (it.ch and it.mid))]
-        if len(usable) < 1:
+        if len(items) < 1:
             return {
-                "ok": True,
+                "ok": False,
+                "error": note or "אין סרטונים חדשים לשמוע",
                 "pairs": [],
                 "checked": 0,
                 "lib": len(by_key),
                 "fps": [],
                 "next_mid": next_cur,
-                "error": note or "אין סרטונים בסיבוב",
-                "note": note or "אין סרטונים בסיבוב",
             }
 
-        fresh = []
+        heard = []
         errs = []
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
-            for it in usable[:3]:
+            for it in items[:3]:
                 raw = td / (str(it.mid or "x") + ".bin")
                 wav = td / (str(it.mid or "x") + ".wav")
                 try:
                     await download_media_obj(it.file_id or "", it.ch or chat_id, it.mid, raw)
                     if not raw.exists() or raw.stat().st_size < 1000:
-                        raise RuntimeError("קובץ ריק")
+                        raise RuntimeError("קובץ ריק אחרי הורדה")
                     extract_audio(raw, wav)
                     try:
                         raw.unlink()
@@ -327,32 +459,36 @@ async def scan(body: ScanIn, x_dup_secret: Optional[str] = Header(None)):
                         pass
                     fp, dur = fpcalc(str(wav))
                     row = row_of(it, fp, dur)
-                    fresh.append(row)
+                    heard.append(row)
                     by_key[row["key"]] = row
                 except Exception as e:
                     err = short_err(e)
                     if "not-video" in err:
                         continue
                     errs.append(err)
-                    fresh.append({"key": it.key, "fp": "", "dur": 0, "mid": it.mid, "ch": it.ch, "label": it.label, "err": err})
 
         all_rows = [by_key[k] for k in by_key if by_key[k].get("fp")]
-        fresh_keys = set(x["key"] for x in fresh if x.get("fp"))
+        fresh_keys = set(x["key"] for x in heard if x.get("fp"))
         pairs = pair_rows(all_rows, fresh_keys)
         save_lib(all_rows)
-        fps_out = [{"key": r["key"], "fp": r["fp"], "mid": r.get("mid") or 0, "ch": r.get("ch") or "", "label": r.get("label") or "", "dur": r.get("dur") or 0} for r in fresh if r.get("fp")]
-        out = {
+        if not heard:
+            return {
+                "ok": False,
+                "error": (errs[0] if errs else note) or "ראיתי סרטון אבל לא הצלחתי לקחת אותו",
+                "pairs": [],
+                "checked": 0,
+                "lib": len(all_rows),
+                "fps": [],
+                "next_mid": next_cur,
+            }
+        return {
             "ok": True,
             "pairs": pairs,
-            "checked": len(fresh),
+            "checked": len(heard),
             "lib": len(all_rows),
-            "fps": fps_out,
+            "fps": [{"key": r["key"], "fp": r["fp"], "mid": r.get("mid") or 0, "ch": r.get("ch") or "", "label": r.get("label") or "", "dur": r.get("dur") or 0} for r in heard],
             "next_mid": next_cur,
         }
-        if not fps_out and errs:
-            out["error"] = errs[0]
-            out["note"] = errs[0]
-        return out
     except Exception as e:
         return {
             "ok": False,
