@@ -1,6 +1,5 @@
 import os, json, tempfile, subprocess, itertools, traceback, asyncio
 from pathlib import Path
-import httpx
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
@@ -20,6 +19,7 @@ _tg_lock = asyncio.Lock()
 _auth_client = None
 _auth_hash = ""
 _auth_phone = ""
+_peers_ready = False
 
 
 class Item(BaseModel):
@@ -174,7 +174,18 @@ def short_err(e):
     return s[:180]
 
 
-_peers_ready = False
+def new_user_client(session=""):
+    from pyrogram import Client
+    kw = dict(
+        name="dupuser",
+        api_id=int(API_ID),
+        api_hash=API_HASH,
+        in_memory=True,
+        no_updates=True,
+    )
+    if session:
+        kw["session_string"] = session
+    return Client(**kw)
 
 
 async def load_peers(client):
@@ -198,8 +209,6 @@ async def resolve_chat(client, chat_id: str):
     try:
         n = int(raw)
         tries.append(n)
-        if n < 0 and not str(n).startswith("-100"):
-            tries.append(int("-100" + str(abs(n))))
     except Exception:
         pass
     last = None
@@ -210,17 +219,6 @@ async def resolve_chat(client, chat_id: str):
             last = e
             continue
     raise last or RuntimeError("Peer id invalid")
-    from pyrogram import Client
-    kw = dict(
-        name="dupuser",
-        api_id=int(API_ID),
-        api_hash=API_HASH,
-        in_memory=True,
-        no_updates=True,
-    )
-    if session:
-        kw["session_string"] = session
-    return Client(**kw)
 
 
 async def tg_client():
@@ -298,7 +296,7 @@ async def collect_from_chat(chat_id: str, start_mid: int, skip_keys, need: int =
         chat = await resolve_chat(client, chat_id)
         ch = int(chat.id)
     except Exception as e:
-        return [], 0, "החשבון שמחובר לא רואה את העמוד הזה. פתח בטלגרם את העמוד פעיל מאותו מספר (" + short_err(e) + ")"
+        return [], 0, "החשבון שמחובר לא רואה את העמוד הזה. פתח בטלגרם את העמוד מאותו מספר. (" + short_err(e) + ")"
     start = int(start_mid or 0)
     if start < 1:
         for mid in (8000, 4000, 2000, 800, 200, 80, 20):
@@ -378,24 +376,27 @@ def health():
 async def auth_start(body: AuthPhone, x_dup_secret: Optional[str] = Header(None)):
     global _auth_client, _auth_hash, _auth_phone
     check_secret(x_dup_secret)
-    if not (API_ID and API_HASH):
-        return {"ok": False, "error": "חסר API_ID"}
-    phone = (body.phone or "").replace(" ", "").replace("-", "")
-    if not phone.startswith("+"):
-        phone = "+" + phone
-    if _auth_client is not None:
-        try:
-            await _auth_client.disconnect()
-        except Exception:
-            pass
-        _auth_client = None
-    c = new_user_client()
-    await c.connect()
-    sent = await c.send_code(phone)
-    _auth_client = c
-    _auth_hash = sent.phone_code_hash
-    _auth_phone = phone
-    return {"ok": True, "phone": phone, "note": "נשלח קוד לטלגרם. שלח את הקוד."}
+    try:
+        if not (API_ID and API_HASH):
+            return {"ok": False, "error": "חסר API_ID"}
+        phone = (body.phone or "").replace(" ", "").replace("-", "")
+        if not phone.startswith("+"):
+            phone = "+" + phone
+        if _auth_client is not None:
+            try:
+                await _auth_client.disconnect()
+            except Exception:
+                pass
+            _auth_client = None
+        c = new_user_client()
+        await c.connect()
+        sent = await c.send_code(phone)
+        _auth_client = c
+        _auth_hash = sent.phone_code_hash
+        _auth_phone = phone
+        return {"ok": True, "phone": phone, "note": "נשלח קוד לטלגרם. שלח את הקוד."}
+    except Exception as e:
+        return {"ok": False, "error": short_err(e)}
 
 
 @app.post("/auth/confirm")
@@ -423,7 +424,6 @@ async def auth_confirm(body: AuthCode, x_dup_secret: Optional[str] = Header(None
             pass
         _auth_client = None
         _tg = None
-        me = None
         c = new_user_client(ss)
         await c.start()
         me = await c.get_me()
