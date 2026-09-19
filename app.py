@@ -174,7 +174,42 @@ def short_err(e):
     return s[:180]
 
 
-def new_user_client(session=""):
+_peers_ready = False
+
+
+async def load_peers(client):
+    global _peers_ready
+    if _peers_ready:
+        return
+    n = 0
+    async for _d in client.get_dialogs():
+        n += 1
+        if n >= 80:
+            break
+    _peers_ready = True
+
+
+async def resolve_chat(client, chat_id: str):
+    await load_peers(client)
+    raw = str(chat_id).strip()
+    tries = []
+    if raw:
+        tries.append(raw)
+    try:
+        n = int(raw)
+        tries.append(n)
+        if n < 0 and not str(n).startswith("-100"):
+            tries.append(int("-100" + str(abs(n))))
+    except Exception:
+        pass
+    last = None
+    for t in tries:
+        try:
+            return await client.get_chat(t)
+        except Exception as e:
+            last = e
+            continue
+    raise last or RuntimeError("Peer id invalid")
     from pyrogram import Client
     kw = dict(
         name="dupuser",
@@ -209,6 +244,10 @@ async def tg_client():
             await _tg.stop()
             _tg = None
             raise RuntimeError("מחובר כבוט במקום כמשתמש")
+        try:
+            await load_peers(_tg)
+        except Exception:
+            pass
         return _tg
 
 
@@ -240,7 +279,12 @@ async def download_media_obj(file_id: str, chat_id: str, mid: int, dest: Path):
     if not chat_id or not mid:
         raise last or RuntimeError("אין סרטון להורדה")
     client = await tg_client()
-    m = await client.get_messages(int(chat_id), int(mid))
+    try:
+        chat = await resolve_chat(client, chat_id)
+        target = chat.id
+    except Exception:
+        target = int(chat_id)
+    m = await client.get_messages(target, int(mid))
     if not is_video_msg(m):
         raise RuntimeError("not-video")
     await pyro_download(m, dest)
@@ -250,7 +294,11 @@ async def download_media_obj(file_id: str, chat_id: str, mid: int, dest: Path):
 
 async def collect_from_chat(chat_id: str, start_mid: int, skip_keys, need: int = 3):
     client = await tg_client()
-    ch = int(str(chat_id).strip())
+    try:
+        chat = await resolve_chat(client, chat_id)
+        ch = int(chat.id)
+    except Exception as e:
+        return [], 0, "החשבון שמחובר לא רואה את העמוד הזה. פתח בטלגרם את העמוד פעיל מאותו מספר (" + short_err(e) + ")"
     start = int(start_mid or 0)
     if start < 1:
         for mid in (8000, 4000, 2000, 800, 200, 80, 20):
