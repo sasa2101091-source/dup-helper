@@ -17,8 +17,8 @@ _tg = None
 
 
 class Item(BaseModel):
-    key: str
-    file_id: str
+    key: str = ""
+    file_id: str = ""
     mid: int = 0
     dur: int = 0
     ch: str = ""
@@ -37,6 +37,8 @@ class KnownFp(BaseModel):
 class ScanIn(BaseModel):
     items: List[Item] = []
     known: Optional[List[KnownFp]] = None
+    chat_id: str = ""
+    start_mid: int = 0
 
 
 def fpcalc(path: str):
@@ -47,9 +49,7 @@ def fpcalc(path: str):
     if r.returncode != 0:
         raise RuntimeError(r.stderr[-200:] if r.stderr else "fpcalc failed")
     data = json.loads(r.stdout)
-    raw = data.get("fingerprint") or ""
-    dur = float(data.get("duration") or 0)
-    return raw, dur
+    return data.get("fingerprint") or "", float(data.get("duration") or 0)
 
 
 def similar(a: str, b: str) -> float:
@@ -57,8 +57,7 @@ def similar(a: str, b: str) -> float:
         return 0.0
     if a == b:
         return 1.0
-    step = 24
-    size = 48
+    step, size = 24, 48
     if len(a) < size or len(b) < size:
         return 1.0 if a[:20] == b[:20] else 0.0
     best = 0.0
@@ -102,7 +101,7 @@ def extract_audio(src: Path, dst: Path):
 
 def row_of(item, fp, dur):
     return {
-        "key": item.key,
+        "key": item.key or (str(item.ch) + ":" + str(item.mid)),
         "fp": fp,
         "dur": dur,
         "mid": item.mid,
@@ -111,27 +110,12 @@ def row_of(item, fp, dur):
     }
 
 
-async def download_small(file_id: str, dest: Path):
-    if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_TOKEN missing on helper")
-    async with httpx.AsyncClient(timeout=90) as c:
-        g = await c.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile", params={"file_id": file_id})
-        js = g.json()
-        if not js.get("ok"):
-            raise RuntimeError(str(js.get("description") or js))
-        path = js["result"]["file_path"]
-        url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}"
-        r = await c.get(url)
-        r.raise_for_status()
-        dest.write_bytes(r.content)
-
-
 async def tg_client():
     global _tg
     if _tg is not None:
         return _tg
     if not (API_ID and API_HASH and BOT_TOKEN):
-        raise RuntimeError("חסר TELEGRAM_API_ID או TELEGRAM_API_HASH ב-Railway")
+        raise RuntimeError("חסר TELEGRAM_API_ID או TELEGRAM_API_HASH")
     from pyrogram import Client
     _tg = Client(
         "duphelper",
@@ -145,39 +129,124 @@ async def tg_client():
     return _tg
 
 
-async def download_large(file_id: str, dest: Path):
-    client = await tg_client()
-    out = await client.download_media(file_id, file_name=str(dest))
-    if not out:
-        raise RuntimeError("pyrogram download empty")
-    p = Path(out)
-    if p.resolve() != dest.resolve():
-        dest.write_bytes(p.read_bytes())
+def is_video_msg(m):
+    if not m or getattr(m, "empty", False):
+        return False
+    if getattr(m, "video", None) or getattr(m, "animation", None) or getattr(m, "video_note", None):
+        return True
+    doc = getattr(m, "document", None)
+    if doc and str(getattr(doc, "mime_type", "") or "").startswith("video"):
+        return True
+    return False
+
+
+async def download_small(file_id: str, dest: Path):
+    async with httpx.AsyncClient(timeout=60) as c:
+        g = await c.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile", params={"file_id": file_id})
+        js = g.json()
+        if not js.get("ok"):
+            raise RuntimeError(str(js.get("description") or js))
+        path = js["result"]["file_path"]
+        r = await c.get(f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}")
+        r.raise_for_status()
+        dest.write_bytes(r.content)
+
+
+async def download_media_obj(file_id: str, chat_id: str, mid: int, dest: Path):
+    if file_id:
         try:
-            p.unlink()
+            await download_small(file_id, dest)
+            return
         except Exception:
             pass
+    client = await tg_client()
+    if file_id:
+        out = await client.download_media(file_id, file_name=str(dest))
+        if out:
+            return
+    if not chat_id or not mid:
+        raise RuntimeError("אין סרטון להורדה")
+    m = await client.get_messages(int(chat_id), int(mid))
+    if not is_video_msg(m):
+        raise RuntimeError("not-video")
+    out = await client.download_media(m, file_name=str(dest))
+    if not out:
+        raise RuntimeError("download empty")
 
 
-async def download_file(file_id: str, dest: Path):
+async def find_start(chat_id: str, start_mid: int) -> int:
+    if start_mid > 0:
+        return start_mid
+    client = await tg_client()
+    ch = int(chat_id)
+    for mid in (25000, 18000, 12000, 8000, 4000, 2000, 800, 200, 80):
+        try:
+            m = await client.get_messages(ch, mid)
+            if m and not getattr(m, "empty", False):
+                return mid
+        except Exception:
+            continue
+    return 0
+
+
+async def collect_from_chat(chat_id: str, start_mid: int, limit_videos: int = 3):
+    client = await tg_client()
+    ch = int(chat_id)
+    start = await find_start(chat_id, start_mid)
+    if start < 1:
+        return [], 0
+    ids = list(range(start, max(0, start - 40), -1))
     try:
-        await download_small(file_id, dest)
-        return "small"
-    except Exception as small_err:
-        msg = str(small_err).lower()
-        if "too big" not in msg and "file is too big" not in msg and "bad request" not in msg:
-            raise
-        await download_large(file_id, dest)
-        return "large"
+        msgs = await client.get_messages(ch, ids)
+    except Exception as e:
+        raise RuntimeError("get_messages: " + str(e)[:120])
+    if not isinstance(msgs, list):
+        msgs = [msgs]
+    items = []
+    last_seen = start
+    for m in msgs:
+        if not m:
+            continue
+        mid = int(getattr(m, "id", 0) or 0)
+        if mid:
+            last_seen = min(last_seen, mid - 1)
+        if not is_video_msg(m):
+            continue
+        items.append(Item(
+            key=str(chat_id) + ":" + str(mid),
+            file_id="",
+            mid=mid,
+            dur=int(getattr(getattr(m, "video", None), "duration", 0) or 0),
+            ch=str(chat_id),
+            label="",
+        ))
+        if len(items) >= limit_videos:
+            break
+    return items, (last_seen if last_seen > 0 else 0)
+
+
+def pair_rows(all_rows, fresh_keys):
+    pairs = []
+    for x, y in itertools.combinations(all_rows, 2):
+        if x["key"] == y["key"]:
+            continue
+        if x["key"] not in fresh_keys and y["key"] not in fresh_keys:
+            continue
+        sc = similar(x["fp"], y["fp"])
+        if sc < 0.68:
+            continue
+        pairs.append({
+            "score": round(sc, 3),
+            "a": {"key": x["key"], "mid": x.get("mid") or 0, "ch": x.get("ch") or "", "label": x.get("label") or "", "dur": x.get("dur") or 0},
+            "b": {"key": y["key"], "mid": y.get("mid") or 0, "ch": y.get("ch") or "", "label": y.get("label") or "", "dur": y.get("dur") or 0},
+        })
+    pairs.sort(key=lambda p: -p["score"])
+    return pairs[:8]
 
 
 @app.get("/health")
 def health():
-    return {
-        "ok": True,
-        "lib": len(load_lib()),
-        "strong": bool(API_ID and API_HASH and BOT_TOKEN),
-    }
+    return {"ok": True, "lib": len(load_lib()), "strong": bool(API_ID and API_HASH and BOT_TOKEN)}
 
 
 @app.post("/scan")
@@ -194,17 +263,25 @@ async def scan(body: ScanIn, x_dup_secret: Optional[str] = Header(None)):
     for k in known:
         if k.key and k.fp:
             by_key[k.key] = row_of(k, k.fp, k.dur)
-    if len(body.items) < 1:
-        return {"ok": True, "pairs": [], "checked": 0, "lib": len(by_key), "fps": [], "note": "אין סרטונים בסיבוב"}
+
+    items = list(body.items or [])
+    next_cur = 0
+    if body.chat_id:
+        found, next_cur = await collect_from_chat(body.chat_id, int(body.start_mid or 0), 3)
+        if found:
+            items = found + items
+
+    if len(items) < 1:
+        return {"ok": True, "pairs": [], "checked": 0, "lib": len(by_key), "fps": [], "next_mid": next_cur, "note": "אין סרטונים בסיבוב"}
 
     fresh = []
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
-        for it in body.items[:6]:
-            raw = td / (str(it.mid) + ".bin")
-            wav = td / (str(it.mid) + ".wav")
+        for it in items[:4]:
+            raw = td / (str(it.mid or "x") + ".bin")
+            wav = td / (str(it.mid or "x") + ".wav")
             try:
-                await download_file(it.file_id, raw)
+                await download_media_obj(it.file_id or "", it.ch or body.chat_id, it.mid, raw)
                 extract_audio(raw, wav)
                 try:
                     raw.unlink()
@@ -213,33 +290,16 @@ async def scan(body: ScanIn, x_dup_secret: Optional[str] = Header(None)):
                 fp, dur = fpcalc(str(wav))
                 row = row_of(it, fp, dur)
                 fresh.append(row)
-                by_key[it.key] = row
+                by_key[row["key"]] = row
             except Exception as e:
-                fresh.append({"key": it.key, "fp": "", "dur": 0, "mid": it.mid, "ch": it.ch, "label": it.label, "err": str(e)[:160]})
+                err = str(e)
+                if "not-video" in err:
+                    continue
+                fresh.append({"key": it.key, "fp": "", "dur": 0, "mid": it.mid, "ch": it.ch, "label": it.label, "err": err[:160]})
 
     all_rows = [by_key[k] for k in by_key if by_key[k].get("fp")]
     fresh_keys = set(x["key"] for x in fresh if x.get("fp"))
-    pairs = []
-    for x, y in itertools.combinations(all_rows, 2):
-        if x["key"] == y["key"]:
-            continue
-        if x["key"] not in fresh_keys and y["key"] not in fresh_keys:
-            continue
-        sc = similar(x["fp"], y["fp"])
-        if sc < 0.68:
-            continue
-        pairs.append({
-            "score": round(sc, 3),
-            "a": {"key": x["key"], "mid": x.get("mid") or 0, "ch": x.get("ch") or "", "label": x.get("label") or "", "dur": x.get("dur") or 0},
-            "b": {"key": y["key"], "mid": y.get("mid") or 0, "ch": y.get("ch") or "", "label": y.get("label") or "", "dur": y.get("dur") or 0},
-        })
-    pairs.sort(key=lambda p: -p["score"])
+    pairs = pair_rows(all_rows, fresh_keys)
     save_lib(all_rows)
     fps_out = [{"key": r["key"], "fp": r["fp"], "mid": r.get("mid") or 0, "ch": r.get("ch") or "", "label": r.get("label") or "", "dur": r.get("dur") or 0} for r in fresh if r.get("fp")]
-    return {
-        "ok": True,
-        "pairs": pairs[:8],
-        "checked": len(fresh),
-        "lib": len(all_rows),
-        "fps": fps_out,
-    }
+    return {"ok": True, "pairs": pairs, "checked": len(fresh), "lib": len(all_rows), "fps": fps_out, "next_mid": next_cur}
