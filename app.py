@@ -1,4 +1,4 @@
-import os, json, tempfile, subprocess, itertools
+import os, json, tempfile, subprocess, itertools, traceback, asyncio
 from pathlib import Path
 import httpx
 from fastapi import FastAPI, Header, HTTPException
@@ -14,6 +14,7 @@ LIB_MAX = 400
 
 app = FastAPI()
 _tg = None
+_tg_lock = asyncio.Lock()
 
 
 class Item(BaseModel):
@@ -26,8 +27,8 @@ class Item(BaseModel):
 
 
 class KnownFp(BaseModel):
-    key: str
-    fp: str
+    key: str = ""
+    fp: str = ""
     mid: int = 0
     dur: int = 0
     ch: str = ""
@@ -47,7 +48,7 @@ def fpcalc(path: str):
         capture_output=True, text=True, timeout=60
     )
     if r.returncode != 0:
-        raise RuntimeError(r.stderr[-200:] if r.stderr else "fpcalc failed")
+        raise RuntimeError((r.stderr or "fpcalc failed")[-200:])
     data = json.loads(r.stdout)
     return data.get("fingerprint") or "", float(data.get("duration") or 0)
 
@@ -110,25 +111,6 @@ def row_of(item, fp, dur):
     }
 
 
-async def tg_client():
-    global _tg
-    if _tg is not None:
-        return _tg
-    if not (API_ID and API_HASH and BOT_TOKEN):
-        raise RuntimeError("חסר TELEGRAM_API_ID או TELEGRAM_API_HASH")
-    from pyrogram import Client
-    _tg = Client(
-        "duphelper",
-        api_id=int(API_ID),
-        api_hash=API_HASH,
-        bot_token=BOT_TOKEN,
-        in_memory=True,
-        no_updates=True,
-    )
-    await _tg.start()
-    return _tg
-
-
 def is_video_msg(m):
     if not m or getattr(m, "empty", False):
         return False
@@ -138,6 +120,40 @@ def is_video_msg(m):
     if doc and str(getattr(doc, "mime_type", "") or "").startswith("video"):
         return True
     return False
+
+
+def short_err(e):
+    s = str(e) or e.__class__.__name__
+    s = s.replace("\n", " ")
+    return s[:180]
+
+
+async def tg_client():
+    global _tg
+    async with _tg_lock:
+        if _tg is not None and getattr(_tg, "is_connected", False):
+            return _tg
+        if not (API_ID and API_HASH and BOT_TOKEN):
+            raise RuntimeError("חסר TELEGRAM_API_ID או TELEGRAM_API_HASH")
+        from pyrogram import Client
+        if _tg is None:
+            _tg = Client(
+                "duphelper",
+                api_id=int(API_ID),
+                api_hash=API_HASH,
+                bot_token=BOT_TOKEN,
+                in_memory=True,
+                no_updates=True,
+            )
+        try:
+            await _tg.start()
+        except Exception as e:
+            msg = str(e).lower()
+            if "already" in msg or "started" in msg:
+                return _tg
+            _tg = None
+            raise
+        return _tg
 
 
 async def download_small(file_id: str, dest: Path):
@@ -152,64 +168,67 @@ async def download_small(file_id: str, dest: Path):
         dest.write_bytes(r.content)
 
 
+async def pyro_download(m_or_id, dest: Path):
+    client = await tg_client()
+    folder = dest.parent
+    folder.mkdir(parents=True, exist_ok=True)
+    out = await client.download_media(m_or_id, file_name=str(folder) + "/")
+    if not out:
+        raise RuntimeError("download empty")
+    p = Path(out)
+    if p.resolve() != dest.resolve():
+        dest.write_bytes(p.read_bytes())
+        try:
+            p.unlink()
+        except Exception:
+            pass
+
+
 async def download_media_obj(file_id: str, chat_id: str, mid: int, dest: Path):
     if file_id:
         try:
             await download_small(file_id, dest)
             return
         except Exception:
-            pass
-    client = await tg_client()
-    if file_id:
-        out = await client.download_media(file_id, file_name=str(dest))
-        if out:
-            return
+            try:
+                await pyro_download(file_id, dest)
+                return
+            except Exception:
+                pass
     if not chat_id or not mid:
         raise RuntimeError("אין סרטון להורדה")
+    client = await tg_client()
     m = await client.get_messages(int(chat_id), int(mid))
     if not is_video_msg(m):
         raise RuntimeError("not-video")
-    out = await client.download_media(m, file_name=str(dest))
-    if not out:
-        raise RuntimeError("download empty")
-
-
-async def find_start(chat_id: str, start_mid: int) -> int:
-    if start_mid > 0:
-        return start_mid
-    client = await tg_client()
-    ch = int(chat_id)
-    for mid in (25000, 18000, 12000, 8000, 4000, 2000, 800, 200, 80):
-        try:
-            m = await client.get_messages(ch, mid)
-            if m and not getattr(m, "empty", False):
-                return mid
-        except Exception:
-            continue
-    return 0
+    await pyro_download(m, dest)
 
 
 async def collect_from_chat(chat_id: str, start_mid: int, limit_videos: int = 3):
     client = await tg_client()
-    ch = int(chat_id)
-    start = await find_start(chat_id, start_mid)
+    ch = int(str(chat_id).strip())
+    start = int(start_mid or 0)
     if start < 1:
-        return [], 0
-    ids = list(range(start, max(0, start - 40), -1))
-    try:
-        msgs = await client.get_messages(ch, ids)
-    except Exception as e:
-        raise RuntimeError("get_messages: " + str(e)[:120])
-    if not isinstance(msgs, list):
-        msgs = [msgs]
+        for mid in (8000, 4000, 2000, 800, 200, 80, 20):
+            try:
+                m = await client.get_messages(ch, mid)
+                if m and not getattr(m, "empty", False):
+                    start = mid
+                    break
+            except Exception:
+                continue
+    if start < 1:
+        return [], 0, "לא מצאתי הודעות בעמוד. הבוט חייב להיות מנהל שם."
     items = []
     last_seen = start
-    for m in msgs:
-        if not m:
+    note = ""
+    for mid in range(start, max(0, start - 25), -1):
+        last_seen = mid - 1
+        try:
+            m = await client.get_messages(ch, mid)
+        except Exception as e:
+            note = short_err(e)
             continue
-        mid = int(getattr(m, "id", 0) or 0)
-        if mid:
-            last_seen = min(last_seen, mid - 1)
         if not is_video_msg(m):
             continue
         items.append(Item(
@@ -222,7 +241,7 @@ async def collect_from_chat(chat_id: str, start_mid: int, limit_videos: int = 3)
         ))
         if len(items) >= limit_videos:
             break
-    return items, (last_seen if last_seen > 0 else 0)
+    return items, (last_seen if last_seen > 0 else 0), note
 
 
 def pair_rows(all_rows, fresh_keys):
@@ -253,53 +272,94 @@ def health():
 async def scan(body: ScanIn, x_dup_secret: Optional[str] = Header(None)):
     if SECRET and x_dup_secret != SECRET:
         raise HTTPException(401, "bad secret")
-    lib = load_lib()
-    known = list(body.known or [])
-    by_key = {}
-    for r in lib:
-        k = str(r.get("key") or "")
-        if k and r.get("fp"):
-            by_key[k] = r
-    for k in known:
-        if k.key and k.fp:
-            by_key[k.key] = row_of(k, k.fp, k.dur)
+    try:
+        lib = load_lib()
+        known = list(body.known or [])
+        by_key = {}
+        for r in lib:
+            k = str(r.get("key") or "")
+            if k and r.get("fp"):
+                by_key[k] = r
+        for k in known:
+            if k.key and k.fp:
+                by_key[k.key] = row_of(k, k.fp, k.dur)
 
-    items = list(body.items or [])
-    next_cur = 0
-    if body.chat_id:
-        found, next_cur = await collect_from_chat(body.chat_id, int(body.start_mid or 0), 3)
-        if found:
-            items = found + items
-
-    if len(items) < 1:
-        return {"ok": True, "pairs": [], "checked": 0, "lib": len(by_key), "fps": [], "next_mid": next_cur, "note": "אין סרטונים בסיבוב"}
-
-    fresh = []
-    with tempfile.TemporaryDirectory() as td:
-        td = Path(td)
-        for it in items[:4]:
-            raw = td / (str(it.mid or "x") + ".bin")
-            wav = td / (str(it.mid or "x") + ".wav")
+        items = list(body.items or [])
+        next_cur = int(body.start_mid or 0)
+        note = ""
+        chat_id = str(body.chat_id or "").strip()
+        if chat_id:
             try:
-                await download_media_obj(it.file_id or "", it.ch or body.chat_id, it.mid, raw)
-                extract_audio(raw, wav)
-                try:
-                    raw.unlink()
-                except Exception:
-                    pass
-                fp, dur = fpcalc(str(wav))
-                row = row_of(it, fp, dur)
-                fresh.append(row)
-                by_key[row["key"]] = row
+                found, next_cur, note = await collect_from_chat(chat_id, int(body.start_mid or 0), 3)
+                if found:
+                    items = found
             except Exception as e:
-                err = str(e)
-                if "not-video" in err:
-                    continue
-                fresh.append({"key": it.key, "fp": "", "dur": 0, "mid": it.mid, "ch": it.ch, "label": it.label, "err": err[:160]})
+                note = "קריאת עמוד: " + short_err(e)
 
-    all_rows = [by_key[k] for k in by_key if by_key[k].get("fp")]
-    fresh_keys = set(x["key"] for x in fresh if x.get("fp"))
-    pairs = pair_rows(all_rows, fresh_keys)
-    save_lib(all_rows)
-    fps_out = [{"key": r["key"], "fp": r["fp"], "mid": r.get("mid") or 0, "ch": r.get("ch") or "", "label": r.get("label") or "", "dur": r.get("dur") or 0} for r in fresh if r.get("fp")]
-    return {"ok": True, "pairs": pairs, "checked": len(fresh), "lib": len(all_rows), "fps": fps_out, "next_mid": next_cur}
+        usable = [it for it in items if (it.file_id or (it.ch and it.mid))]
+        if len(usable) < 1:
+            return {
+                "ok": True,
+                "pairs": [],
+                "checked": 0,
+                "lib": len(by_key),
+                "fps": [],
+                "next_mid": next_cur,
+                "error": note or "אין סרטונים בסיבוב",
+                "note": note or "אין סרטונים בסיבוב",
+            }
+
+        fresh = []
+        errs = []
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            for it in usable[:3]:
+                raw = td / (str(it.mid or "x") + ".bin")
+                wav = td / (str(it.mid or "x") + ".wav")
+                try:
+                    await download_media_obj(it.file_id or "", it.ch or chat_id, it.mid, raw)
+                    if not raw.exists() or raw.stat().st_size < 1000:
+                        raise RuntimeError("קובץ ריק")
+                    extract_audio(raw, wav)
+                    try:
+                        raw.unlink()
+                    except Exception:
+                        pass
+                    fp, dur = fpcalc(str(wav))
+                    row = row_of(it, fp, dur)
+                    fresh.append(row)
+                    by_key[row["key"]] = row
+                except Exception as e:
+                    err = short_err(e)
+                    if "not-video" in err:
+                        continue
+                    errs.append(err)
+                    fresh.append({"key": it.key, "fp": "", "dur": 0, "mid": it.mid, "ch": it.ch, "label": it.label, "err": err})
+
+        all_rows = [by_key[k] for k in by_key if by_key[k].get("fp")]
+        fresh_keys = set(x["key"] for x in fresh if x.get("fp"))
+        pairs = pair_rows(all_rows, fresh_keys)
+        save_lib(all_rows)
+        fps_out = [{"key": r["key"], "fp": r["fp"], "mid": r.get("mid") or 0, "ch": r.get("ch") or "", "label": r.get("label") or "", "dur": r.get("dur") or 0} for r in fresh if r.get("fp")]
+        out = {
+            "ok": True,
+            "pairs": pairs,
+            "checked": len(fresh),
+            "lib": len(all_rows),
+            "fps": fps_out,
+            "next_mid": next_cur,
+        }
+        if not fps_out and errs:
+            out["error"] = errs[0]
+            out["note"] = errs[0]
+        return out
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": short_err(e),
+            "detail": traceback.format_exc()[-400:],
+            "pairs": [],
+            "checked": 0,
+            "lib": 0,
+            "fps": [],
+        }
