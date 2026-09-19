@@ -7,10 +7,14 @@ from typing import List, Optional
 
 SECRET = os.environ.get("DUP_HELPER_SECRET", "")
 BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+API_ID = os.environ.get("TELEGRAM_API_ID", "")
+API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
 LIB_PATH = Path(os.environ.get("DUP_LIB_PATH", "/tmp/dup_lib.json"))
 LIB_MAX = 400
 
 app = FastAPI()
+_tg = None
+
 
 class Item(BaseModel):
     key: str
@@ -20,6 +24,7 @@ class Item(BaseModel):
     ch: str = ""
     label: str = ""
 
+
 class KnownFp(BaseModel):
     key: str
     fp: str
@@ -28,9 +33,11 @@ class KnownFp(BaseModel):
     ch: str = ""
     label: str = ""
 
+
 class ScanIn(BaseModel):
     items: List[Item] = []
     known: Optional[List[KnownFp]] = None
+
 
 def fpcalc(path: str):
     r = subprocess.run(
@@ -43,6 +50,7 @@ def fpcalc(path: str):
     raw = data.get("fingerprint") or ""
     dur = float(data.get("duration") or 0)
     return raw, dur
+
 
 def similar(a: str, b: str) -> float:
     if not a or not b:
@@ -64,6 +72,7 @@ def similar(a: str, b: str) -> float:
                 best = max(best, 0.7)
     return best
 
+
 def load_lib():
     try:
         if LIB_PATH.exists():
@@ -74,6 +83,7 @@ def load_lib():
         pass
     return []
 
+
 def save_lib(rows):
     try:
         if len(rows) > LIB_MAX:
@@ -82,25 +92,13 @@ def save_lib(rows):
     except Exception:
         pass
 
-async def download_file(file_id: str, dest: Path):
-    if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_TOKEN missing on helper")
-    async with httpx.AsyncClient(timeout=90) as c:
-        g = await c.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile", params={"file_id": file_id})
-        js = g.json()
-        if not js.get("ok"):
-            raise RuntimeError(str(js))
-        path = js["result"]["file_path"]
-        url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}"
-        r = await c.get(url)
-        r.raise_for_status()
-        dest.write_bytes(r.content)
 
 def extract_audio(src: Path, dst: Path):
     subprocess.run(
         ["ffmpeg", "-y", "-i", str(src), "-vn", "-ac", "1", "-ar", "16000", "-t", "90", "-f", "wav", str(dst)],
         check=True, capture_output=True, timeout=90
     )
+
 
 def row_of(item, fp, dur):
     return {
@@ -112,9 +110,75 @@ def row_of(item, fp, dur):
         "label": item.label,
     }
 
+
+async def download_small(file_id: str, dest: Path):
+    if not BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN missing on helper")
+    async with httpx.AsyncClient(timeout=90) as c:
+        g = await c.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile", params={"file_id": file_id})
+        js = g.json()
+        if not js.get("ok"):
+            raise RuntimeError(str(js.get("description") or js))
+        path = js["result"]["file_path"]
+        url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}"
+        r = await c.get(url)
+        r.raise_for_status()
+        dest.write_bytes(r.content)
+
+
+async def tg_client():
+    global _tg
+    if _tg is not None:
+        return _tg
+    if not (API_ID and API_HASH and BOT_TOKEN):
+        raise RuntimeError("חסר TELEGRAM_API_ID או TELEGRAM_API_HASH ב-Railway")
+    from pyrogram import Client
+    _tg = Client(
+        "duphelper",
+        api_id=int(API_ID),
+        api_hash=API_HASH,
+        bot_token=BOT_TOKEN,
+        in_memory=True,
+        no_updates=True,
+    )
+    await _tg.start()
+    return _tg
+
+
+async def download_large(file_id: str, dest: Path):
+    client = await tg_client()
+    out = await client.download_media(file_id, file_name=str(dest))
+    if not out:
+        raise RuntimeError("pyrogram download empty")
+    p = Path(out)
+    if p.resolve() != dest.resolve():
+        dest.write_bytes(p.read_bytes())
+        try:
+            p.unlink()
+        except Exception:
+            pass
+
+
+async def download_file(file_id: str, dest: Path):
+    try:
+        await download_small(file_id, dest)
+        return "small"
+    except Exception as small_err:
+        msg = str(small_err).lower()
+        if "too big" not in msg and "file is too big" not in msg and "bad request" not in msg:
+            raise
+        await download_large(file_id, dest)
+        return "large"
+
+
 @app.get("/health")
 def health():
-    return {"ok": True, "lib": len(load_lib())}
+    return {
+        "ok": True,
+        "lib": len(load_lib()),
+        "strong": bool(API_ID and API_HASH and BOT_TOKEN),
+    }
+
 
 @app.post("/scan")
 async def scan(body: ScanIn, x_dup_secret: Optional[str] = Header(None)):
@@ -136,18 +200,22 @@ async def scan(body: ScanIn, x_dup_secret: Optional[str] = Header(None)):
     fresh = []
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
-        for it in body.items[:12]:
+        for it in body.items[:6]:
             raw = td / (str(it.mid) + ".bin")
             wav = td / (str(it.mid) + ".wav")
             try:
                 await download_file(it.file_id, raw)
                 extract_audio(raw, wav)
+                try:
+                    raw.unlink()
+                except Exception:
+                    pass
                 fp, dur = fpcalc(str(wav))
                 row = row_of(it, fp, dur)
                 fresh.append(row)
                 by_key[it.key] = row
             except Exception as e:
-                fresh.append({"key": it.key, "fp": "", "dur": 0, "mid": it.mid, "ch": it.ch, "label": it.label, "err": str(e)[:120]})
+                fresh.append({"key": it.key, "fp": "", "dur": 0, "mid": it.mid, "ch": it.ch, "label": it.label, "err": str(e)[:160]})
 
     all_rows = [by_key[k] for k in by_key if by_key[k].get("fp")]
     fresh_keys = set(x["key"] for x in fresh if x.get("fp"))
